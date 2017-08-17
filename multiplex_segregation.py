@@ -22,6 +22,9 @@ import matplotlib.pyplot as plt
 from descartes import PolygonPatch
 import matplotlib.cm as cm
 from geopandas.tools import overlay
+from mpl_toolkits.mplot3d import Axes3D
+from mpl_toolkits.mplot3d.art3d import Line3DCollection
+import matplotlib as mpl
 
 ox.config(log_file=True, log_console=True, use_cache=True)
 
@@ -123,15 +126,41 @@ def construct_street_graph(blocks, crs_osm, crs_utm, alpha, buffer_dist=0, speed
     print('Generating geometry...')
     area = gpd.GeoDataFrame(geometry = boundary_from_areas(blocks, alpha = alpha, buffer_dist = buffer_dist))
     area.crs = crs_utm
-    geometry = area.to_crs(crs_osm).unary_union
+    geoms = area.to_crs(crs_osm).unary_union
     
     print('Generating street graph...')
-    G = ox.graph_from_polygon(polygon = geometry, network_type = network_type, name = 'street_network')
+    G = ox.graph_from_polygon(polygon = geoms, network_type = network_type, name = 'street_network')
     print('Reprojecting street graph...')
     G = ox.project_graph(G, to_crs=crs_utm)
+    G = to_undirected(G)
+    G = to_time_weighted(G, speed)
+
+    node_id = [u for u in G.nodes(data=False)]
+    geoms = [geometry.Point(data['x'], data['y']) for u, data in G.nodes(data=True)]
+    node_dict= dict(zip(node_id, geoms))
+
+    nx.set_node_attributes(G, 'geometry', node_dict)
+
     G.name = 'street'
     print('done!')
     return G, area
+
+def to_undirected(G):
+    #make undirected, while conserving multidigraph structure
+    edges = []
+    for u, v, keys, data in G.edges(data=True, keys=True):
+        if data['oneway']:
+            data['oneway']= False
+            G[u][v][keys]['oneway'] = False
+            edges.append((v,u,data))
+    G.add_edges_from(edges)
+    return G
+
+def to_time_weighted(G, speed):
+    for u, v, keys, data in G.edges(data='length', keys=True):
+        UJT = 1/(speed * 16.666666666667) #turn km/h to min/meter
+        G[u][v][keys]['weight'] = data * UJT
+    return G
 
 ## create helper function to simplify bus stops to 50m radius
 def join_lines(line, line_list):
@@ -558,11 +587,10 @@ def create_tram_network(linesGPD, stopsGPD, area, speed = 40):
     G.name = 'tram'
     return(G)
 
-#create helped function
-def find_nearest_node(tn, sn):
+def find_nearest_node(data, nodes, spatial_index, buff = 50):
     """ 
     Given two networks find nearest nodes in target network for
-    all nodes in source network
+    all nodes in source network by recursion
     
     parameters:
         tn : target network
@@ -570,8 +598,28 @@ def find_nearest_node(tn, sn):
     returns:
         pandas.series: index of all records in tn that are nearest sn
     """
+    polygon = data['geometry'].buffer(buff)
+    possible_matches_index = list(spatial_index.intersection(polygon.bounds))
+    possible_matches = nodes.iloc[possible_matches_index]
+    if len(possible_matches) == 0:
+        buff += 50
+        v = find_nearest_node(data, nodes, spatial_index, buff)
+    elif len(possible_matches) == 1:
+        v = possible_matches.index[0]
+        return v
+    elif len(possible_matches) > 1:
+        p1 = data['geometry']
+        dist = possible_matches.distance(p1)
+        v = dist[dist == min(dist)].index[0]
+        return v
+    else:
+        print('no match')
+    return v
+
+
+
     
-def integrate_network(street_network, transport_networks, waiting_times):
+def create_multiplex(street_network, transport_networks, waiting_times):
     """
     Create a multiplex based on different transport networks
     
@@ -581,8 +629,64 @@ def integrate_network(street_network, transport_networks, waiting_times):
         waiting_times: dictionary containing waiting times between transport_networks and street_network
         
     returns:
-        integrated_network: networkx.MultiDiGraph
+        multiplex: networkx.MultiDiGraph
     """
+
+    #set transport type attribute to nodes
+    nx.set_node_attributes(street_network, 'network_type', street_network.name)
+    nx.set_node_attributes(street_network, 'z', 0)
+    #relabel nodes
+    node_ori = [u for u in street_network.nodes(data=False)]
+    node_new = ['{}-{}'.format(u, list(street_network.name)[0]) for u in node_ori]
+    node_dict= dict(zip(node_ori, node_new))
+    street_network = nx.relabel_nodes(street_network, node_dict)
+
+    multiplex = street_network.copy()
+    multiplex.name = 'multiplex'
+    nx.set_edge_attributes(multiplex, 'transfer', False)
+
+    i = 1
+    for G in transport_networks:
+        nx.set_node_attributes(G, 'network_type', G.name)
+        nx.set_node_attributes(G, 'z', i)
+        nx.set_edge_attributes(G, 'transfer', False)
+        #relabel nodes
+        node_ori = [u for u in G.nodes(data=False)]
+        node_new = ['{}-{}'.format(u, list(G.name)[0]) for u in node_ori]
+        node_dict= dict(zip(node_ori, node_new))
+        G = nx.relabel_nodes(G, node_dict)
+
+        #add node and edges to graph
+        multiplex.add_nodes_from(G.nodes(data=True))
+        multiplex.add_edges_from(G.edges(data=True))
+
+        stops = pd.DataFrame.from_dict(G.node, orient = 'index')
+        stops = gpd.GeoDataFrame(stops)
+
+        nodes = pd.DataFrame.from_dict(street_network.node, orient = 'index')
+        nodes = gpd.GeoDataFrame(nodes)
+        spatial_index = nodes.sindex
+
+        #find nearest street node to every stop to join network
+        for u, data in G.nodes(data=True):
+            v = find_nearest_node(data, nodes, spatial_index)
+            # print('adding edge between: u = {} and v={}'.format(u,v))
+            multiplex.add_edge(u = u,
+                               v = v, 
+                               transfer = True,
+                               transfer_type = G.name,
+                               weight = 0.1,
+                              )
+            multiplex.add_edge(u = v,
+                   v = u, 
+                   transfer = True,
+                   transfer_type = G.name,
+                   weight = waiting_times[i-1],
+                  )
+        i += 1
+
+    nx.set_edge_attributes(multiplex, 'osmid', range(len(list(multiplex.edges()))))
+    return multiplex
     
 
 def plot_network(G, area):
@@ -629,6 +733,108 @@ def plot_network(G, area):
     ax.set_ylim((south - margin_ns, north + margin_ns))
     ax.set_xlim((west - margin_ew, east + margin_ew))
     plt.show()
+
+def plot_multiplex(multiplex, save = False):
+    """
+    Creates plot for network and urban area.
+
+    Parameters
+    ----------
+    G: transport network as networkx multidigraph
+    area: boundary as geopandas geoseries 
+
+    Returns
+    ----------
+    None
+    """
+
+    G = nx.convert_node_labels_to_integers(multiplex)
+    node_Xs = [float(node['x']) for node in G.node.values()]
+    node_Ys = [float(node['y']) for node in G.node.values()]
+    node_Zs = np.array([float(d['z'])*1000 for i, d in G.nodes(data=True)])
+    node_size = []
+    size = 1
+    node_color =[]
+
+    for i, d in G.nodes(data=True):
+        if d['network_type']=='street':
+            node_size.append(size)
+            node_color.append('#66ccff')
+        elif d['network_type']=='bus':
+            node_size.append(size*4)
+            node_color.append('#fb9a98')
+        elif d['network_type']=='tram':
+            node_size.append(size*8)
+            node_color.append('#9bc37e') 
+
+    lines = []
+    lineWidth =[]
+    lwidth = 0.2
+    for u, v, key, data in G.edges(keys=True, data=True):
+        if 'geometry' in data:
+            # if it has a geometry attribute (a list of line segments), add them
+            # to the list of lines to plot
+            xs, ys = data['geometry'].xy
+            zs = [G.node[u]['z']*1000 for i in range(len(xs))] 
+            lines.append([list(a) for a in zip(xs, ys, zs)])
+            if data['transfer']:
+                if data['transfer_type']=='bus':
+                    lineWidth.append(lwidth/4)
+                else:
+                    lineWidth.append(lwidth/1.5)
+            else:
+                lineWidth.append(lwidth)
+        else:
+            # if it doesn't have a geometry attribute, the edge is a straight
+            # line from node to node
+            x1 = G.node[u]['x']
+            y1 = G.node[u]['y']
+            z1 = G.node[u]['z']*1000
+            x2 = G.node[v]['x']
+            y2 = G.node[v]['y']
+            z2 = G.node[v]['z']*1000
+            line = [[x1, y1, z1], [x2, y2, z2]]
+            lines.append(line)
+            if data['transfer']:
+                if data['transfer_type']=='bus':
+                    lineWidth.append(lwidth/6)
+                else:
+                    lineWidth.append(lwidth/1.5)
+            else:
+                lineWidth.append(lwidth)
+
+    fig_height=15
+    lc = Line3DCollection(lines, linewidths=lineWidth, alpha = 1, color = '#999999', zorder=1)
+    edges = ox.graph_to_gdfs(G, nodes=False, fill_edge_geometry=True)
+    west, south, east, north = edges.total_bounds
+    bbox_aspect_ratio = (north-south)/(east-west)
+    fig_width = fig_height / bbox_aspect_ratio
+    fig = plt.figure(figsize=(fig_width, fig_height))
+    ax = fig.gca(projection='3d')
+    ax.add_collection3d(lc)
+    ax.scatter(node_Xs, node_Ys, node_Zs, s=node_size, c=node_color, zorder=2)
+
+    ax.set_ylim(south, north)
+    ax.set_xlim(west, east)
+    ax.set_zlim(0, 2500)
+    ax.axis('off')
+    ax.margins(0)
+    ax.tick_params(which='both', direction='in')
+    fig.canvas.draw()
+    # ax.get_xaxis().get_major_formatter().set_useOffset(False)
+    # ax.get_yaxis().get_major_formatter().set_useOffset(False)
+    ax.set_facecolor('white')
+    ax.set_aspect('equal')
+
+    plt.show()
+
+    if save:
+        extent = ax.get_window_extent().transformed(fig.dpi_scale_trans.inverted())
+        filename = 'multiplex'
+        output_img = 'images'
+        file_format = 'png'
+        path_filename = '{}/{}.{}'.format(output_img, filename, file_format)
+        fig.savefig(path_filename, dpi=300, bbox_inches=extent, format=file_format, facecolor=fig.get_facecolor(), transparent=True)
 
 
 
