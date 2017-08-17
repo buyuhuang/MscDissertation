@@ -280,6 +280,32 @@ def create_transfers(G, weight = 15):
                                osmid = np.nan
                               )
     return G
+
+def snap_lines_to_points(G):
+    """
+    Snap all edge lines to stops
+    """
+    for u, v, keys, line in G.edges(data='geometry', keys=True):
+        if isinstance(line, geometry.LineString):
+            lcoords = list(line.coords)
+            start = [(G.node[u]['x'], G.node[u]['y'])]
+            end = [(G.node[v]['x'], G.node[v]['y'])]
+            sPoint = geometry.Point(lcoords[0])
+            sPoint_ = geometry.Point((G.node[u]['x'], G.node[u]['y']))
+            if sPoint.distance(sPoint_) <50:
+                if len(lcoords)>2:
+                    coords = start + lcoords[1:len(lcoords)-1] + end
+                else:
+                    coords = start + lcoords[1:len(lcoords)-1] + end    
+            else:
+                if len(lcoords)>2:
+                    coords = end + lcoords[1:len(lcoords)-1] + start
+                else:
+                    coords = end + lcoords[1:len(lcoords)-1] + start
+            line = geometry.LineString(coords)
+            G[u][v][keys]['geometry'] = line
+    return G
+
     
 def cut(line, distance):
     # Cuts a line in two at a distance from its starting point
@@ -387,8 +413,177 @@ def construct_bus_network(linesGPD, stopsGPD, area, crs_utm = {'init':'epsg:3271
     #create network
     G = ox.gdfs_to_graph(node_list, edge_list)
     G = create_transfers(G)
+    G = snap_lines_to_points(G)
     G.name = 'bus'
     return(G)
+
+def clean_lines_tram(tramLineGPD):
+    """
+    Make geodataframe of lines that contains only single line strings
+    and make lineString Z into linestring
+    """
+    lines_list = []
+    for i, tram_line in tramLineGPD.iterrows():
+        line = tram_line.geometry
+        #check if line is multilinestring to store as multiple singlelinesstrings
+        if isinstance(line, geometry.MultiLineString):
+            lgeos = line.geoms
+            lines = []
+            for tl in lgeos:
+                tlines = []
+                if tl.length > 20 and tl.coords[0] != tl.coords[-1]:
+                    coord = list(tl.coords)
+                    for j in range(len(coord)):
+                        point = coord[j][0:2]
+                        tlines.append(point)
+                    lines.append(coord)
+            #choose first line and look for continuation
+            lineCoord = lines[0]
+            lineList = lines[1:]
+            lineJoin = join_lines(lineCoord, lineList)
+            lineJoin = join_lines(list(reversed(lineJoin)), lineList)
+            tlines = geometry.LineString(coor for coor in lineJoin)
+            linesGPD = gpd.GeoDataFrame({'way': [tram_line.Layer],
+                                         'geometry': [tlines],
+                                         'ngeom': [1],
+                                       })
+        else:
+            line_list = []
+            coord = list(line.coords)
+            for j in range(len(coord)):
+                point = coord[j][0:2]
+                line_list.append(point)
+            line = geometry.LineString(coor for coor in line_list)                
+            linesGPD = gpd.GeoDataFrame({'way': [tram_line.Layer],
+                                         'geometry': [line],
+                                         'ngeom': [1]
+                                       })
+
+        lines_list.append(linesGPD)
+    res = gpd.GeoDataFrame(pd.concat(lines_list, ignore_index=True))
+    return res    
+
+def snap_stops_to_lines_tram(tramLine, tramStops, area, tolerance = 50):
+    """
+    Snaps points to lines based on tolerance distance
+    """
+    stop_list = []
+
+        #snap points to line
+    for i, tram_line in tramLine.iterrows():
+        line = tram_line.geometry
+
+        #get only points within buffer and inside area
+        line_buff = line.buffer(tolerance)
+        stops = tramStops[tramStops.intersects(line_buff)]
+        stops = stops[stops.intersects(area.geometry[0])]
+        stops = clean_stops(stops, tolerance)
+        points_snap = [line.project(stop) for stop in stops.geometry]
+        snapped_points = [line.interpolate(point) for point in points_snap]
+        pointsGPD = gpd.GeoDataFrame({'way': [tram_line.way for i in range(len(snapped_points))],
+                                    'geometry': snapped_points,
+                                    'ngeom': [tram_line.ngeom for i in range(len(snapped_points))],
+                                    'lgth': points_snap,
+                                    'x': [point.xy[0][0] for point in snapped_points],
+                                    'y': [point.xy[1][0] for point in snapped_points]
+                                       })
+        stop_list.append(pointsGPD)
+    res = gpd.GeoDataFrame(pd.concat(stop_list, ignore_index=True))
+    #remove duplicates and na
+    res = res.drop_duplicates(subset=['way', 'lgth', 'x', 'y'])
+    res = res.dropna(how = 'all')
+    #give unique id to points
+    res['id']= [id_ for id_ in range(len(res))]
+    return res
+        
+def create_tram_network(linesGPD, stopsGPD, area, speed = 40):
+    """
+    Create tram network from tram lines and tram stop geometries
+    """
+    linesGPD = clean_lines_tram(linesGPD)
+    stopsGPD = snap_stops_to_lines_tram(linesGPD, stopsGPD, area)
+    UJT = 1/(speed * 16.666666666667) #turn km/h to min/meter
+    
+    line_list = []
+
+    #cut lines at points
+    for i, tram_line in linesGPD.iterrows():
+        line = tram_line.geometry
+        stop_ = stopsGPD[stopsGPD.way == tram_line.way]
+        stop_sorted = stop_.sort_values(by = "lgth").reset_index()
+        if len(stop_sorted) is not 0:
+            for point in range(len(stop_sorted)-1):
+                pId = stop_sorted.id[point]
+                pId2 = stop_sorted.id[point+1]
+                dist1 = stop_sorted.lgth[point]
+                dist2 = stop_sorted.lgth[point+1]
+                lgth = dist2 - dist1
+                cut1 = cut(line, dist1)
+                if len(cut1) > 1:
+                    tLine = cut1[1]
+                else:
+                    tLine = cut1[0]
+                cut2 = cut(tLine, lgth)[0]
+                #only save if line starts and ends on stops
+                if (stop_sorted.geometry[point].distance(geometry.Point(cut2.coords[0]))<1) and (stop_sorted.geometry[point+1].distance(geometry.Point(cut2.coords[-1]))<1):
+                    edgeGPD = gpd.GeoDataFrame({'way': [tram_line.way],
+                                                'geometry': [cut2],
+                                                'ngeom': [tram_line.ngeom],
+                                                'lgth': [lgth],
+                                                'u': [pId],
+                                                'v': [pId2],
+                                                'from': [cut2.coords[0]],
+                                                'to': [cut2.coords[-1]],
+                                                'weight': [lgth*UJT]
+                                               })
+                    line_list.append(edgeGPD)
+    edge_list = gpd.GeoDataFrame(pd.concat(line_list, ignore_index=True))
+    edge_list['key'] = [i for i in range(len(edge_list))]
+    edge_list['osmid'] = [i for i in range(len(edge_list))]
+    node_list = stopsGPD
+    node_list['osmid'] = [i for i in range(len(node_list))]
+    node_list.gdf_name = 'Nodes_list'
+    for way in linesGPD.way.unique():
+        plt.style.use('ggplot')
+        fig, ax = plt.subplots(figsize = (10,3))
+        fig.suptitle('Tram Line: {}'.format(way), fontsize=12, fontweight='bold')
+        ax.set_aspect("equal")
+        stopsGPD[stopsGPD.way==way].plot(ax=ax, color = 'red')
+        edge_list[edge_list.way==way].plot(ax=ax, color = 'grey')
+        plt.show()
+    
+    #create network
+    G = ox.gdfs_to_graph(node_list, edge_list)
+    G = create_transfers(G, weight = 10)
+    G.name = 'tram'
+    return(G)
+
+#create helped function
+def find_nearest_node(tn, sn):
+    """ 
+    Given two networks find nearest nodes in target network for
+    all nodes in source network
+    
+    parameters:
+        tn : target network
+        sn : source network
+    returns:
+        pandas.series: index of all records in tn that are nearest sn
+    """
+    
+def integrate_network(street_network, transport_networks, waiting_times):
+    """
+    Create a multiplex based on different transport networks
+    
+    parameters:
+        street_network: street graph (networkx graph object)
+        transport_networks: dictionary containing transport network graphs (networkx graph object)
+        waiting_times: dictionary containing waiting times between transport_networks and street_network
+        
+    returns:
+        integrated_network: networkx.MultiDiGraph
+    """
+    
 
 def plot_network(G, area):
     """
