@@ -1,7 +1,9 @@
 ################################################################################
 # Module: multiplex_segregation.py
-# Description: retrieve and construct multiplex network from bus, tram and street network
-# 			   for the city of Cuenca, Ecuador. Scripts Developed as part of MSc. in Smart
+# Description: Retrieves and constructs multiplex network from bus, tram and street network
+# 			   for the city of Cuenca, Ecuador. Multiplex is used to calculate segregation
+#              using ICV index from socio economic data using random walks.
+#              Scripts Developed as part of MSc. in Smart
 #              Cities and Urban Analytics Dissertation 
 # License: MIT, see full license in LICENSE.txt
 # Web: mateoneira.github.io
@@ -25,6 +27,8 @@ from geopandas.tools import overlay
 from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Line3DCollection
 import matplotlib as mpl
+import matplotlib.colors as colors
+import seaborn as sns
 
 ox.config(log_file=True, log_console=True, use_cache=True)
 
@@ -35,13 +39,13 @@ def boundary_from_areas(blocks, alpha = 1, buffer_dist = 0):
 
     Parameters
     ----------
-	blocks: geodataframe containing city block shape geometry
-	alpha: alpha value to calculate alpha shape of boundary area
-	buffer_dist: buffer distance to create boundary (in meters)
+    	blocks: geodataframe containing city block shape geometry
+    	alpha: alpha value to calculate alpha shape of boundary area
+    	buffer_dist: buffer distance to create boundary (in meters)
 
 	Returns
     ----------
-	geopandas geoseries 
+    	boundary: geopandas geoseries 
     """
 
     #get vertex of polygon
@@ -110,17 +114,17 @@ def construct_street_graph(blocks, crs_osm, crs_utm, alpha, buffer_dist=0, speed
 
     Parameters
     ----------
-	blocks: geodataframe containing city block shape geometry
-	crs_osm: projection system of Open Street Map
-	crs_utm: projection system of blocks
-	alpha: alpha value to calcualte alpha shape of boundary area
-	buffer_dist: buffer distance to retrieve network (in meters)
-	speed: speed for calculating weights of edges (km/h)
+    	blocks: geodataframe containing city block shape geometry
+    	crs_osm: projection system of Open Street Map
+    	crs_utm: projection system of blocks
+    	alpha: alpha value to calcualte alpha shape of boundary area
+    	buffer_dist: buffer distance to retrieve network (in meters)
+    	speed: speed for calculating weights of edges (km/h)
 
 	Returns
     ----------
-	networkx multidigraph
-	geopandas geoseries 
+    	street_network: networkx multidigraph
+    	area: geopandas geoseries 
     """
     network_type = 'drive'  
     print('Generating geometry...')
@@ -162,9 +166,20 @@ def to_time_weighted(G, speed):
         G[u][v][keys]['weight'] = data * UJT
     return G
 
-## create helper function to simplify bus stops to 50m radius
+
 def join_lines(line, line_list):
-    #create a new list with reverse coords
+    """
+    Joins multiline geometries and returns a linstring object through recursion
+
+    Parameters
+    ----------
+        line: list containing list of point geometries of coordinates of linestrings contained within multilinestring 
+        line_list: list containing coordinates of linestring contained within multilinestring
+
+    Returns
+    ----------
+        single array of coordinates defining joined line: array
+    """
     p1 = geometry.Point(line[-1])
     list_ = []
     lList = []
@@ -186,7 +201,16 @@ def join_lines(line, line_list):
 
 def clean_stops(stops, tolerance = 50):
     """
-    Clean stops geometry clusters by merging and returning cluster centroids
+    Joins bus stops that are within a tolerance distance and returns centroid
+
+    Parameters
+    ----------
+        stops: geopandas object containing stop geometries
+        tolerance: distance tolerance in meters
+
+    Returns
+    ----------
+        stops: geoseries
     """
     buffered_stops = stops.buffer(tolerance).unary_union
     if isinstance(buffered_stops, geometry.Polygon):
@@ -197,7 +221,15 @@ def clean_stops(stops, tolerance = 50):
 
 def clean_lines(busLineGPD):
     """
-    Make geodataframe of lines that contains only single line strings
+    Creates geodataframe containing geometries of LineString objects
+
+    Parameters
+    ----------
+        busLineGPD: geopandasdataframe containing buslines geometries
+
+    Returns
+    ----------
+        lines: geodataframe
     """
     lines_list = []
     for lineNum in busLineGPD.LINEA.unique():
@@ -245,6 +277,17 @@ def snap_stops_to_lines(busLineGPD, busStopsGPD, area, tolerance = 50):
     """
     Snaps points to lines based on tolerance distance and line number
     Returns a GPD with stops along with their line number and way
+
+    Parameters
+    ----------
+        busLineGPD: geopandasdataframe containing bus lines geometries
+        busStopsGPD: geopandasdataframe containing bus stop geometries
+        area: geoseries of boundary polygon
+        tolerance: distance tolerance for snapping points (in meters)
+
+    Returns
+    ----------
+        stops: geodataframe
     """
     stop_list = []
     for lineNum in busLineGPD.nline.unique():
@@ -282,10 +325,17 @@ def snap_stops_to_lines(busLineGPD, busStopsGPD, area, tolerance = 50):
 
 def create_transfers(G, weight = 15):
     """
-    Creates transfers between bus lines based on proximity
-    Also cleans geometry of nodes
+    Creates transfer edges based on proximity 
+
+    Parameters
+    ----------
+        G: multidigraph of transport network
+        weight: time between transfers in minutes
+
+    Returns
+    ----------
+        G: multidigraph 
     """
-    #get node geometry
     stops_geoms = pd.DataFrame.from_dict(G.node, orient='index')
     stops_geoms = gpd.GeoDataFrame(stops_geoms)
     stops_buff = stops_geoms.buffer(15).unary_union
@@ -312,7 +362,16 @@ def create_transfers(G, weight = 15):
 
 def snap_lines_to_points(G):
     """
-    Snap all edge lines to stops
+    Snaps begining and end of lines to nodes geometry
+
+    Parameters
+    ----------
+        G: multidigraph of transport network
+        weight: time between transfers in minutes
+
+    Returns
+    ----------
+        G: multidigraph 
     """
     for u, v, keys, line in G.edges(data='geometry', keys=True):
         if isinstance(line, geometry.LineString):
@@ -353,7 +412,7 @@ def cut(line, distance):
                 geometry.LineString(coords[:i] + [(cp.x, cp.y)]),
                 geometry.LineString([(cp.x, cp.y)] + coords[i:])]
         
-def construct_bus_network(linesGPD, stopsGPD, area, crs_utm = {'init':'epsg:32717'}, speed = 30):
+def create_bus_network(linesGPD, stopsGPD, area, crs_utm = {'init':'epsg:32717'}, speed = 30):
     """
     Creates bus network graph from line and stop shapefile data 
     within the spatial boundaries of the blocks polygon
@@ -525,7 +584,7 @@ def snap_stops_to_lines_tram(tramLine, tramStops, area, tolerance = 50):
     res['id']= [id_ for id_ in range(len(res))]
     return res
         
-def create_tram_network(linesGPD, stopsGPD, area, speed = 40):
+def create_tram_network(linesGPD, stopsGPD, area, crs_utm = {'init':'epsg:32717'},speed = 40):
     """
     Create tram network from tram lines and tram stop geometries
     """
@@ -572,6 +631,8 @@ def create_tram_network(linesGPD, stopsGPD, area, speed = 40):
     node_list = stopsGPD
     node_list['osmid'] = [i for i in range(len(node_list))]
     node_list.gdf_name = 'Nodes_list'
+    node_list.crs = crs_utm
+    edge_list.crs = crs_utm
     for way in linesGPD.way.unique():
         plt.style.use('ggplot')
         fig, ax = plt.subplots(figsize = (10,3))
@@ -837,45 +898,100 @@ def plot_multiplex(multiplex, save = False):
         fig.savefig(path_filename, dpi=300, bbox_inches=extent, format=file_format, facecolor=fig.get_facecolor(), transparent=True)
 
 
-
-
-## helper function adapted from: 
 def network_stats(G, area):
     """
     Calculates descriptive statistics for transport network
-    Based on primal approach of multiple centrality assessment 
+    Based On:
+        shortest path betweenness 
+        random walk betweenness
+        reaching centrality
+        information centrality
     
     G: networkx multidigraph 
-    area: area in m
+    area: area in meters of urban extent
     
     returns: 
-    pandas dataframe
+    G: multidigraph with added measures
     """
     area = area / 1e6
     
     #number of nodes and edges of graph
     n = len(list(G.nodes()))
     m = len(list(G.edges()))
-    valuesDF.to_csv('{}/street_stats.csv'.format(output_path))
 
+    print('calculating shortest path betweenness...')
+    eb = nx.edge_betweenness_centrality(G, weight = 'weight')
+    nb = nx.betweenness_centrality(G, weight = 'weight')
+
+    print('calculating random walk betweenness...')
+    G_undirected = G.to_undirected(reciprocal=False)
+    erwb = nx.edge_current_flow_betweenness_centrality(G_undirected, weight = 'weight')
+    nrwb = nx.current_flow_betweenness_centrality(G_undirected, weight = 'weight')
+
+
+    print('calculating reaching centrality...')
+    # G_line = nx.line_graph(G)
+    # erc = nx.local_reaching_centrality(G_line, G.nodes())
+    # nrc = nx.local_reaching_centrality(G, G.nodes())
+
+    print('calculating information centrality...')
+    G_line_undirected = nx.line_graph(G_undirected)
+    eic = nx.current_flow_closeness_centrality(G_line_undirected, weight = 'weight')
+    nic = nx.current_flow_closeness_centrality(G_undirected, weight = 'weight')
+
+    measures = [[eb,nb, G, 'Betweenness Centrality'], 
+            [erwb,nrwb,G, 'Random Walk Betweenness'],
+            # [erc,nrc,G, 'Reaching Centrality'],
+            [eic,nic,G, 'Information Centrality']
+           ]   
+
+    print('generating plots...')
     ##plot values
-    for plot in plots:
-	    nc = ox.get_node_colors_by_stat(street_graph, data=plots[plot])
-	    fig, ax = ox.plot_graph(street_graph,
-	                            fig_height = 15,
-	                            node_size = 10,
-	                            node_color = nc,
-	                            node_zorder=2,
-	                            edge_color='w',
-	                            edge_linewidth=0.5,
-	                            edge_alpha=0.6,
-	                            bgcolor = '#333333',
-	                            save = True, 
-	                            show = True,
-	                            close = True,
-	                            filename = 'street_stats_{}'.format(plot), 
-	                            dpi=1200
-	                           )
+    for measure in measures:
+        print('calculating measures for: {}'.format(measure[3]))
+        ev = []
+        keys = []
+        for (u,v,k) in measure[2].edges(keys=True):
+            keys.append((u,v,k))
+            if (u,v,k) in measure[0].keys():
+                ev.append(measure[0][(u,v,k)])
+            elif (u,v) in measure[0].keys():
+                ev.append(measure[0][(u,v)])
+            elif (u,v,k) in measure[0].keys():
+                ev.append(measure[0][(v,u,k)])
+            else:
+                ev.append(-1)
+        evdict = dict(zip(keys, ev))
+        enorm = colors.Normalize(vmin=min(ev), vmax=max(ev))
+        ecmap = cm.ScalarMappable(norm=enorm, cmap=cm.viridis)
+        ec= [ecmap.to_rgba(cl) for cl in ev]
+        
+        nv = [measure[1][node] for node in measure[2]]
+        nnorm = colors.Normalize(vmin=min(nv), vmax=max(nv))
+        ncmap = cm.ScalarMappable(norm=nnorm, cmap=cm.viridis)    
+        nc= [ncmap.to_rgba(cl) for cl in nv]
+        nx.set_node_attributes(G, measure[3], measure[1])
+        nx.set_edge_attributes(G, measure[3], evdict)
+
+        
+        fig, ax = ox.plot_graph(measure[2],
+                                fig_height = 10,
+                                node_size = 15,
+                                node_color = nc,
+                                node_zorder=2,
+                                edge_color=ec,
+                                edge_linewidth=0.1,
+                                edge_alpha=1,
+                                bgcolor = '#202020',
+                                show = True,
+                                close = True,
+                                dpi=600,
+                                equal_aspect=True,
+                               )
+        g = sns.distplot(nv, hist=False, kde_kws=dict(cumulative=True), 
+                     axlabel= measure[3])
+        g.figure.savefig("images/{}.pdf".format(measure[3]), format = 'pdf')
+    return G
 
 def intersection_voronoi(network, area, crs_utm, plot = True):
 	"""
