@@ -3,7 +3,7 @@
 # Description: Retrieves and constructs multiplex network from bus, tram and street network
 # 			   for the city of Cuenca, Ecuador. Multiplex is used to calculate segregation
 #              using ICV index from socio economic data using random walks.
-#              Scripts Developed as part of MSc. in Smart
+#              Scripts developed as part of MSc. in Smart
 #              Cities and Urban Analytics Dissertation 
 # License: MIT, see full license in LICENSE.txt
 # Web: mateoneira.github.io
@@ -18,6 +18,7 @@ import osmnx as ox
 import shapely.geometry as geometry
 from shapely.ops import cascaded_union, polygonize, linemerge
 from shapely.wkt import loads
+import scipy as sp
 from scipy.spatial import Delaunay, Voronoi, voronoi_plot_2d
 import math
 import matplotlib.pyplot as plt
@@ -29,6 +30,8 @@ from mpl_toolkits.mplot3d.art3d import Line3DCollection
 import matplotlib as mpl
 import matplotlib.colors as colors
 import seaborn as sns
+from scipy.sparse import identity, spdiags, linalg
+import time
 
 ox.config(log_file=True, log_console=True, use_cache=True)
 
@@ -1191,4 +1194,107 @@ def blocks_to_nodes(network, blocks, area, crs_utm, plot = True):
     print('done!')
     return network
 
+
+def rw_laplacian(G, weight = 'weight'):
+    ##create adjecency matrix
+    M = nx.to_scipy_sparse_matrix(G, 
+                                  nodelist=nodelist, 
+                                  weight=weight,
+                                  dtype=float)
+    n, m = M.shape
+
+    #create diagnal
+    DI = spdiags(1.0 / sp.array(M.sum(axis=1).flat), [0], n, n)
+
+    #probability transition matrix
+    P = DI * M
+
+    #get eigenvectors and eigenvalues of probability matrix
+    evals, evecs = linalg.eigs(P.T, k=1)
+
+    v = evecs.flatten().real
+    p = v / v.sum()
+    sqrtp = sp.sqrt(p)
+
+    Q = spdiags(sqrtp, [0], n, n) * P * spdiags(1.0 / sqrtp, [0], n, n)
+    I = sp.identity(len(G))
+
+    #directed laplacian matrix
+    rwlaplacian = I - (Q + Q.T) / 2.0
+    return rwlaplacian
+
+def spatial_outreach(G, t=20):
+    """
+    Calculates spatial outreach (strano 2015) of street nodes in the mUltiplex
+    
+    G: multiplex
+    T: travel cost
+    
+    returns: 
+    dict with node ids and values
+    """
+
+    #get node list
+    full_start_time = time.time()
+    nodes = list(G.nodes())
+    #get only street nodes
+    street_nodes = ([s for s in nodes if 's' in s])
+    soi = []
+    for i in street_nodes:
+        print('starting calculation for node {}'.format(i))
+        start_time = time.time()
+        dist = []
+        #get nodes within temporal constraint
+        G_i = nx.ego_graph(G, i, radius = t, center=False, distance = 'weight')
+        son = list(G_i.nodes())
+        for j in son:
+            so_ij = nx.dijkstra_path_length(G, i, j, weight = 'length')
+            dist.append(so_ij)
+        so_index = sum(dist)/len(dist)
+        soi.append(so_index)
+        print('calculated spatial outreach for node: {} in {:.2f} seconds'.format(i,time.time() - start_time))
+
+    spatial_outreach_dict = dict(zip(nodes, soi))
+    print('calculated spatial outreach for graph in {:.2f} seconds'.format(time.time() - full_start_time))
+    return spatial_outreach_dict
+
+
+def random__walk_segregation(G, group = "Q1", alpha = 0.8):
+    # qij = probability of a journey starting in i ending in j
+    # qij can we calculate this with a temporal constraint? using spatial outreach
+    alpha = 0.8
+    #get weighted adj. matrix
+    W = nx.adjacency_matrix(g, weight='Betweenness Centrality')
+    #add self-edge in matrix and invert distance - higher values if closer distance
+
+    #Get degree matrix
+    Degree = sp.sparse.spdiags(1./W.sum(1).T, 0, *W.shape)
+
+    #create identity matrix
+    I = sp.identity(len(G))
+
+    #create row stochastic matrix
+    P = Degree * W
+
+    #create matrix Q such that q_ij is the probability that wark started in i ends in j
+    Q = (1-alpha) * (I - alpha * P).I * P
+
+    #get group concentrations and group densities as column vectors
+    con_g = 'Q1'
+    den_g = 'Q1'
+    con_g.shape(len(con_g),1)
+    den_g.shape(len(den_g),1)
+
+    #calculate isolation index
+    isolation = np.multiply(db,(Q*cb))
+
+    #normalize isolation index
+    n_g = 1
+    n = 2
+
+    isolation_norm = (n_g/n)**-1 * segregation
+
+    res = dict(zip(list(g.nodes()), isolation_norm)) 
+
+    return res
 
