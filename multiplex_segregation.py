@@ -472,7 +472,7 @@ def create_bus_network(linesGPD, stopsGPD, area, crs_utm = {'init':'epsg:32717'}
                                                         'route': [bus_line.route, bus_line.route],
                                                         'geometry': [cut2, cut2],
                                                         'ngeom': [bus_line.ngeom, bus_line.ngeom],
-                                                        'lgth': [lgth, lgth],
+                                                        'length': [lgth, lgth],
                                                         'u': [pId, pId2],
                                                         'v': [pId2, pId],
                                                         'from': [cut2.coords[0], cut2.coords[-1]],
@@ -620,7 +620,7 @@ def create_tram_network(linesGPD, stopsGPD, area, crs_utm = {'init':'epsg:32717'
                     edgeGPD = gpd.GeoDataFrame({'way': [tram_line.way],
                                                 'geometry': [cut2],
                                                 'ngeom': [tram_line.ngeom],
-                                                'lgth': [lgth],
+                                                'length': [lgth],
                                                 'u': [pId],
                                                 'v': [pId2],
                                                 'from': [cut2.coords[0]],
@@ -1241,30 +1241,43 @@ def spatial_outreach(G, t=20):
     street_nodes = ([s for s in nodes if 's' in s])
     soi = []
     for i in street_nodes:
-        print('starting calculation for node {}'.format(i))
         start_time = time.time()
         dist = []
         #get nodes within temporal constraint
-        G_i = nx.ego_graph(G, i, radius = t, center=False, distance = 'weight')
-        son = list(G_i.nodes())
-        for j in son:
-            so_ij = nx.dijkstra_path_length(G, i, j, weight = 'length')
-            dist.append(so_ij)
-        so_index = sum(dist)/len(dist)
-        soi.append(so_index)
-        print('calculated spatial outreach for node: {} in {:.2f} seconds'.format(i,time.time() - start_time))
+        G_i = nx.ego_graph(G, i, radius = t, center=True, distance = 'weight')
 
-    spatial_outreach_dict = dict(zip(nodes, soi))
+        #get calculate euclidian distance
+        nodes = nx.get_node_attributes(G_i,'geometry')
+        ori_point = nodes[i]
+        nodes.pop(i)
+        dest_points = [nodes[k] for k in nodes.keys()]
+        dist = np.array([ori_point.distance(dest) for dest in dest_points])
+        avg_dist = dist.sum()/len(dist)
+        soi.append(avg_dist)
+        # print('calculated spatial outreach for node: {} in {:.2f} seconds, max: {}'.format(i,time.time() - start_time, max_dist))
+
+    spatial_outreach_dict = dict(zip(street_nodes, soi))
     print('calculated spatial outreach for graph in {:.2f} seconds'.format(time.time() - full_start_time))
     return spatial_outreach_dict
 
 
-def random__walk_segregation(G, group = "Q1", alpha = 0.8):
+def random__walk_segregation(G, group = "Q1", alpha = 0.85):
+    ## get initial values as column vectors
+    n_i = np.array(list(nx.get_node_attributes(G, 'nPeople').values()))
+    n = n_i.sum()
+
+    c_gi = np.array(list(nx.get_node_attributes(G,group).values()))
+    n_gi = c_gi * n_i
+    n_g = n_gi.sum()
+    d_gi = n_gi / n_g
+
+    c_gi.shape = (len(c_gi),1)
+    d_gi.shape = (len(d_gi),1)
+
     # qij = probability of a journey starting in i ending in j
     # qij can we calculate this with a temporal constraint? using spatial outreach
-    alpha = 0.8
     #get weighted adj. matrix
-    W = nx.adjacency_matrix(g, weight='Betweenness Centrality')
+    W = nx.adjacency_matrix(G, weight='betweenness')
     #add self-edge in matrix and invert distance - higher values if closer distance
 
     #Get degree matrix
@@ -1276,25 +1289,99 @@ def random__walk_segregation(G, group = "Q1", alpha = 0.8):
     #create row stochastic matrix
     P = Degree * W
 
-    #create matrix Q such that q_ij is the probability that wark started in i ends in j
+    #create matrix Q such that q_ij is the probability that walk started in i ends in j
     Q = (1-alpha) * (I - alpha * P).I * P
 
-    #get group concentrations and group densities as column vectors
-    con_g = 'Q1'
-    den_g = 'Q1'
-    con_g.shape(len(con_g),1)
-    den_g.shape(len(den_g),1)
-
     #calculate isolation index
-    isolation = np.multiply(db,(Q*cb))
+    isolation_gi = np.multiply(den_gi,(Q*con_gi))
 
-    #normalize isolation index
-    n_g = 1
-    n = 2
+    norm_isolation_gi = (n_g/n)**-1 * isolation_gi
+    sigma_bar = list(np.array(norm_isolation_gi.flatten())[0])
 
-    isolation_norm = (n_g/n)**-1 * segregation
-
-    res = dict(zip(list(g.nodes()), isolation_norm)) 
+    res = dict(zip(list(G.nodes()), sigma_bar)) 
 
     return res
+
+def multiplex_stats(G):
+    """
+    Calculates descriptive statistics for multiplex
+    Based On:
+        shortest path betweenness 
+        spatial outreach
+    
+    G: networkx multidigraph 
+    area: area in meters of urban extent
+    
+    returns: 
+    G: multidigraph with added measures
+    """
+    
+    #number of nodes and edges of graph
+    n = len(list(G.nodes()))
+    m = len(list(G.edges()))
+
+    print('calculating shortest path betweenness...')
+    eb = nx.edge_betweenness_centrality(G, weight = 'weight')
+    nb = nx.betweenness_centrality(G, weight = 'weight')
+
+    print('calculating spatial outreach...')
+    soi = spatial_outreach(G, t=20)
+
+    measures = [[eb,nb, G, 'Betweenness Centrality'], 
+               [soi,0,G, 'Spatial Outreach']
+           ] 
+
+    print('generating plots...')
+    ##plot values
+    for measure in measures:
+        print('calculating measures for: {}'.format(measure[3]))
+        ev = []
+        keys = []
+        if len(measure[0]) != 0:
+            for (u,v,k) in measure[2].edges(keys=True):
+                keys.append((u,v,k))
+                if (u,v,k) in measure[0].keys():
+                    ev.append(measure[0][(u,v,k)])
+                elif (u,v) in measure[0].keys():
+                    ev.append(measure[0][(u,v)])
+                elif (u,v,k) in measure[0].keys():
+                    ev.append(measure[0][(v,u,k)])
+                else:
+                    ev.append(-1)
+        else:
+            for (u,v,k) in measure[2].edges(keys=True):
+                keys.append((u,v,k))
+                ev.append(0)
+
+        evdict = dict(zip(keys, ev))
+        enorm = colors.Normalize(vmin=min(ev), vmax=max(ev))
+        ecmap = cm.ScalarMappable(norm=enorm, cmap=cm.viridis)
+        ec= [ecmap.to_rgba(cl) for cl in ev]
+        
+        nv = [measure[1][node] for node in measure[2]]
+        nnorm = colors.Normalize(vmin=min(nv), vmax=max(nv))
+        ncmap = cm.ScalarMappable(norm=nnorm, cmap=cm.viridis)    
+        nc= [ncmap.to_rgba(cl) for cl in nv]
+        nx.set_node_attributes(G, measure[3], measure[1])
+        nx.set_edge_attributes(G, measure[3], evdict)
+
+        
+        fig, ax = ox.plot_graph(measure[2],
+                                fig_height = 10,
+                                node_size = 15,
+                                node_color = nc,
+                                node_zorder=2,
+                                edge_color=ec,
+                                edge_linewidth=0.1,
+                                edge_alpha=1,
+                                bgcolor = '#202020',
+                                show = True,
+                                close = True,
+                                dpi=600,
+                                equal_aspect=True,
+                               )
+        g = sns.distplot(nv, hist=False, kde_kws=dict(cumulative=True), 
+                     axlabel= measure[3])
+        g.figure.savefig("images/{}.pdf".format(measure[3]), format = 'pdf')
+    return G
 
